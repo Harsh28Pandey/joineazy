@@ -9,119 +9,108 @@ const getAssignments = async (req, res, next) => {
     const userId = req.user.id;
     const isAdmin = req.user.role === 'admin';
 
-    let assignments;
+    // 1. Fetch all assignments with professor information
+    const allAsgRes = await db.query(`
+      SELECT a.id, a.title, a.description, a.due_date, a.onedrive_link,
+             a.target_type, a.status, a.created_by, a.created_at, a.updated_at,
+             u.name as professor_name, u.email as professor_email
+      FROM assignments a
+      LEFT JOIN users u ON a.created_by = u.id
+      ORDER BY a.due_date ASC
+    `);
+    const allAssignments = allAsgRes.rows;
+
+    // 2. Fetch all target groups associations
+    const targetsRes = await db.query(`
+      SELECT atg.assignment_id, atg.group_id, g.name as group_name
+      FROM assignment_target_groups atg
+      JOIN groups g ON atg.group_id = g.id
+    `);
+    const targetsMap = new Map();
+    targetsRes.rows.forEach(t => {
+      if (!targetsMap.has(t.assignment_id)) {
+        targetsMap.set(t.assignment_id, []);
+      }
+      targetsMap.get(t.assignment_id).push({ id: t.group_id, name: t.group_name });
+    });
+
+    // 3. Fetch all submissions
+    const subsRes = await db.query(`
+      SELECT s.id, s.assignment_id, s.group_id, s.submitted_by_user_id, s.status,
+             s.submission_notes, s.onedrive_item_url, s.confirmed_at,
+             g.name as group_name, u.name as confirmed_by_name, u.email as confirmed_by_email
+      FROM submissions s
+      JOIN groups g ON s.group_id = g.id
+      LEFT JOIN users u ON s.submitted_by_user_id = u.id
+    `);
+    const subsMap = new Map();
+    subsRes.rows.forEach(s => {
+      if (!subsMap.has(s.assignment_id)) {
+        subsMap.set(s.assignment_id, []);
+      }
+      subsMap.get(s.assignment_id).push(s);
+    });
+
+    // 4. Fetch total groups count
+    const totalGroupsRes = await db.query('SELECT COUNT(*) as count FROM groups');
+    const totalGroupsCount = parseInt(totalGroupsRes.rows[0].count, 10) || 0;
+
+    let assignments = [];
 
     if (isAdmin) {
-      // Admin sees all assignments
-      const result = await db.query(`
-        SELECT a.*, u.name as professor_name,
-               COUNT(DISTINCT s.id) as total_submissions
-        FROM assignments a
-        LEFT JOIN users u ON a.created_by = u.id
-        LEFT JOIN submissions s ON a.id = s.assignment_id AND s.status = 'CONFIRMED'
-        GROUP BY a.id, u.name
-        ORDER BY a.due_date ASC
-      `);
+      // Admin sees all assignments with full metrics
+      assignments = allAssignments.map(asg => {
+        const targetGroups = targetsMap.get(asg.id) || [];
+        const asgSubs = (subsMap.get(asg.id) || []).filter(s => s.status === 'CONFIRMED');
 
-      // Fetch target groups for each assignment
-      assignments = await Promise.all(
-        result.rows.map(async (asg) => {
-          let targetGroups = [];
-          if (asg.target_type === 'SPECIFIC_GROUPS') {
-            const tgRes = await db.query(
-              `SELECT g.id, g.name FROM assignment_target_groups atg
-               JOIN groups g ON atg.group_id = g.id
-               WHERE atg.assignment_id = $1`,
-              [asg.id]
-            );
-            targetGroups = tgRes.rows;
-          }
+        const totalExpectedGroups = asg.target_type === 'ALL'
+          ? totalGroupsCount
+          : targetGroups.length;
 
-          // Count total expected groups
-          let totalExpectedGroups = 0;
-          if (asg.target_type === 'ALL') {
-            const gCountRes = await db.query('SELECT COUNT(*) as count FROM groups');
-            totalExpectedGroups = parseInt(gCountRes.rows[0].count, 10);
-          } else {
-            totalExpectedGroups = targetGroups.length;
-          }
+        const confirmedCount = asgSubs.length;
+        const isOverdue = new Date(asg.due_date) < new Date();
+        const submissionRate = totalExpectedGroups > 0
+          ? Math.round((confirmedCount / totalExpectedGroups) * 100)
+          : 0;
 
-          const confirmedCount = parseInt(asg.total_submissions, 10) || 0;
-          const isOverdue = new Date(asg.due_date) < new Date();
-
-          return {
-            ...asg,
-            target_groups: targetGroups,
-            total_expected_groups: totalExpectedGroups,
-            confirmed_submissions: confirmedCount,
-            submission_rate: totalExpectedGroups > 0 ? Math.round((confirmedCount / totalExpectedGroups) * 100) : 0,
-            is_overdue: isOverdue
-          };
-        })
-      );
+        return {
+          ...asg,
+          target_groups: targetGroups,
+          total_expected_groups: totalExpectedGroups,
+          confirmed_submissions: confirmedCount,
+          submission_rate: submissionRate,
+          is_overdue: isOverdue
+        };
+      });
     } else {
-      // Student: find user's groups first
+      // Student: find user's groups
       const userGroupsRes = await db.query(
         'SELECT group_id FROM group_members WHERE user_id = $1',
         [userId]
       );
-      const userGroupIds = userGroupsRes.rows.map(r => r.group_id);
+      const userGroupIds = new Set(userGroupsRes.rows.map(r => r.group_id));
 
-      // Find assignments targeted to ALL or to the student's groups
-      let querySql;
-      let queryParams = [];
+      // Filter: ACTIVE and (target_type = ALL or student's group targeted)
+      const applicable = allAssignments.filter(asg => {
+        if (asg.status !== 'ACTIVE') return false;
+        if (asg.target_type === 'ALL') return true;
+        const targets = targetsMap.get(asg.id) || [];
+        return targets.some(t => userGroupIds.has(t.id));
+      });
 
-      if (userGroupIds.length > 0) {
-        querySql = `
-          SELECT DISTINCT a.*, u.name as professor_name
-          FROM assignments a
-          LEFT JOIN users u ON a.created_by = u.id
-          LEFT JOIN assignment_target_groups atg ON a.id = atg.assignment_id
-          WHERE a.status = 'ACTIVE'
-            AND (a.target_type = 'ALL' OR atg.group_id = ANY($1))
-          ORDER BY a.due_date ASC
-        `;
-        queryParams = [userGroupIds];
-      } else {
-        // Not in any group yet: see ALL assignments
-        querySql = `
-          SELECT a.*, u.name as professor_name
-          FROM assignments a
-          LEFT JOIN users u ON a.created_by = u.id
-          WHERE a.status = 'ACTIVE' AND a.target_type = 'ALL'
-          ORDER BY a.due_date ASC
-        `;
-      }
+      assignments = applicable.map(asg => {
+        const asgSubs = subsMap.get(asg.id) || [];
+        const mySubmissions = asgSubs.filter(s => userGroupIds.has(s.group_id));
+        const isSubmitted = mySubmissions.some(s => s.status === 'CONFIRMED');
+        const isOverdue = new Date(asg.due_date) < new Date();
 
-      const asgResult = await db.query(querySql, queryParams);
-
-      // For each assignment, check submission status for each of student's groups
-      assignments = await Promise.all(
-        asgResult.rows.map(async (asg) => {
-          let mySubmissions = [];
-          if (userGroupIds.length > 0) {
-            const subRes = await db.query(
-              `SELECT s.*, g.name as group_name, u.name as confirmed_by_name
-               FROM submissions s
-               JOIN groups g ON s.group_id = g.id
-               LEFT JOIN users u ON s.submitted_by_user_id = u.id
-               WHERE s.assignment_id = $1 AND s.group_id = ANY($2)`,
-              [asg.id, userGroupIds]
-            );
-            mySubmissions = subRes.rows;
-          }
-
-          const isSubmitted = mySubmissions.some(s => s.status === 'CONFIRMED');
-          const isOverdue = new Date(asg.due_date) < new Date();
-
-          return {
-            ...asg,
-            is_submitted: isSubmitted,
-            is_overdue: isOverdue,
-            my_submissions: mySubmissions
-          };
-        })
-      );
+        return {
+          ...asg,
+          is_submitted: isSubmitted,
+          is_overdue: isOverdue,
+          my_submissions: mySubmissions
+        };
+      });
     }
 
     res.json({
@@ -142,7 +131,9 @@ const getAssignmentById = async (req, res, next) => {
     const isAdmin = req.user.role === 'admin';
 
     const asgRes = await db.query(
-      `SELECT a.*, u.name as professor_name, u.email as professor_email
+      `SELECT a.id, a.title, a.description, a.due_date, a.onedrive_link,
+              a.target_type, a.status, a.created_by, a.created_at, a.updated_at,
+              u.name as professor_name, u.email as professor_email
        FROM assignments a
        LEFT JOIN users u ON a.created_by = u.id
        WHERE a.id = $1`,
@@ -167,7 +158,9 @@ const getAssignmentById = async (req, res, next) => {
 
     // Fetch submissions
     const subRes = await db.query(
-      `SELECT s.*, g.name as group_name, u.name as confirmed_by_name, u.email as confirmed_by_email
+      `SELECT s.id, s.assignment_id, s.group_id, s.submitted_by_user_id, s.status,
+              s.submission_notes, s.onedrive_item_url, s.confirmed_at,
+              g.name as group_name, u.name as confirmed_by_name, u.email as confirmed_by_email
        FROM submissions s
        JOIN groups g ON s.group_id = g.id
        LEFT JOIN users u ON s.submitted_by_user_id = u.id

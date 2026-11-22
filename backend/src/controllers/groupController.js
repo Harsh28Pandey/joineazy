@@ -3,50 +3,70 @@ const db = require('../db');
 
 // Helper to calculate group progress and badges
 const calculateGroupMetrics = async (groupId) => {
-  // Get all assignments applicable to this group (ALL or specifically targeted)
-  const assignmentsRes = await db.query(
-    `SELECT DISTINCT a.id, a.due_date,
-       (s.id IS NOT NULL AND s.status = 'CONFIRMED') as is_submitted
-     FROM assignments a
-     LEFT JOIN assignment_target_groups atg ON a.id = atg.assignment_id
-     LEFT JOIN submissions s ON a.id = s.assignment_id AND s.group_id = $1
-     WHERE (a.target_type = 'ALL' OR atg.group_id = $1)
-       AND a.status = 'ACTIVE'`,
-    [groupId]
-  );
+  try {
+    // Get all assignments applicable to this group (ALL or specifically targeted)
+    const assignmentsRes = await db.query(
+      `SELECT a.id, a.due_date, s.id as submission_id, s.status as submission_status
+       FROM assignments a
+       LEFT JOIN assignment_target_groups atg ON a.id = atg.assignment_id
+       LEFT JOIN submissions s ON a.id = s.assignment_id AND s.group_id = $1
+       WHERE (a.target_type = 'ALL' OR atg.group_id = $1)
+         AND a.status = 'ACTIVE'`,
+      [groupId]
+    );
 
-  const totalAssigned = assignmentsRes.rows.length;
-  const completedCount = assignmentsRes.rows.filter(a => a.is_submitted).length;
-  const pendingCount = totalAssigned - completedCount;
-  const progressPercent = totalAssigned > 0 ? Math.round((completedCount / totalAssigned) * 100) : 0;
+    // Deduplicate by assignment id in JS
+    const uniqueAssignmentsMap = new Map();
+    assignmentsRes.rows.forEach(r => {
+      if (!uniqueAssignmentsMap.has(r.id)) {
+        uniqueAssignmentsMap.set(r.id, r);
+      }
+    });
 
-  // Determine badge
-  let badge = 'Getting Started';
-  let badgeColor = 'gray';
-  if (totalAssigned > 0) {
-    if (progressPercent === 100) {
-      badge = 'All Completed';
-      badgeColor = 'emerald';
-    } else if (progressPercent >= 66) {
-      badge = 'Top Performer';
-      badgeColor = 'indigo';
-    } else if (progressPercent >= 33) {
-      badge = 'On Track';
-      badgeColor = 'blue';
-    } else {
-      badge = 'Pending Work';
-      badgeColor = 'amber';
+    const uniqueAssignments = Array.from(uniqueAssignmentsMap.values());
+    const totalAssigned = uniqueAssignments.length;
+    const completedCount = uniqueAssignments.filter(a => a.submission_id && a.submission_status === 'CONFIRMED').length;
+    const pendingCount = totalAssigned - completedCount;
+    const progressPercent = totalAssigned > 0 ? Math.round((completedCount / totalAssigned) * 100) : 0;
+
+    // Determine badge
+    let badge = 'Getting Started';
+    let badgeColor = 'gray';
+    if (totalAssigned > 0) {
+      if (progressPercent === 100) {
+        badge = 'All Completed';
+        badgeColor = 'emerald';
+      } else if (progressPercent >= 66) {
+        badge = 'Top Performer';
+        badgeColor = 'indigo';
+      } else if (progressPercent >= 33) {
+        badge = 'On Track';
+        badgeColor = 'blue';
+      } else {
+        badge = 'Pending Work';
+        badgeColor = 'amber';
+      }
     }
-  }
 
-  return {
-    totalAssigned,
-    completedCount,
-    pendingCount,
-    progressPercent,
-    badge,
-    badgeColor
-  };
+    return {
+      totalAssigned,
+      completedCount,
+      pendingCount,
+      progressPercent,
+      badge,
+      badgeColor
+    };
+  } catch (err) {
+    console.error('Error calculating group metrics for', groupId, err);
+    return {
+      totalAssigned: 0,
+      completedCount: 0,
+      pendingCount: 0,
+      progressPercent: 0,
+      badge: 'Getting Started',
+      badgeColor: 'gray'
+    };
+  }
 };
 
 // Get groups
@@ -62,21 +82,19 @@ const getGroups = async (req, res, next) => {
 
     if (isAdmin || all === 'true') {
       groupsSql = `
-        SELECT g.*, u.name as leader_name, u.email as leader_email,
-               COUNT(DISTINCT gm.user_id) as member_count
+        SELECT g.id, g.name, g.description, g.join_code, g.created_by, g.created_at, g.updated_at,
+               u.name as leader_name, u.email as leader_email
         FROM groups g
         LEFT JOIN users u ON g.created_by = u.id
-        LEFT JOIN group_members gm ON g.id = gm.group_id
-        GROUP BY g.id, u.name, u.email
         ORDER BY g.created_at DESC
       `;
     } else {
       groupsSql = `
-        SELECT g.*, u.name as leader_name, u.email as leader_email,
-               gm_me.role_in_group as my_role,
-               (SELECT COUNT(DISTINCT gm2.user_id) FROM group_members gm2 WHERE gm2.group_id = g.id) as member_count
+        SELECT g.id, g.name, g.description, g.join_code, g.created_by, g.created_at, g.updated_at,
+               u.name as leader_name, u.email as leader_email,
+               gm.role_in_group as my_role
         FROM groups g
-        JOIN group_members gm_me ON g.id = gm_me.group_id AND gm_me.user_id = $1
+        JOIN group_members gm ON g.id = gm.group_id AND gm.user_id = $1
         LEFT JOIN users u ON g.created_by = u.id
         ORDER BY g.created_at DESC
       `;
@@ -84,14 +102,26 @@ const getGroups = async (req, res, next) => {
     }
 
     const groupsResult = await db.query(groupsSql, params);
+    const groupsList = groupsResult.rows;
+
+    // Fetch member counts for all groups in one fast aggregate query
+    const memberCountsRes = await db.query(`
+      SELECT group_id, COUNT(user_id) as count
+      FROM group_members
+      GROUP BY group_id
+    `);
+    const countMap = new Map();
+    memberCountsRes.rows.forEach(r => {
+      countMap.set(r.group_id, parseInt(r.count, 10));
+    });
 
     // Enrich groups with live metrics
     const enrichedGroups = await Promise.all(
-      groupsResult.rows.map(async (grp) => {
+      groupsList.map(async (grp) => {
         const metrics = await calculateGroupMetrics(grp.id);
         return {
           ...grp,
-          member_count: parseInt(grp.member_count, 10) || 0,
+          member_count: countMap.get(grp.id) || 0,
           metrics
         };
       })
@@ -113,7 +143,8 @@ const getGroupById = async (req, res, next) => {
     const { id } = req.params;
 
     const groupRes = await db.query(
-      `SELECT g.*, u.name as leader_name, u.email as leader_email
+      `SELECT g.id, g.name, g.description, g.join_code, g.created_by, g.created_at, g.updated_at,
+              u.name as leader_name, u.email as leader_email
        FROM groups g
        LEFT JOIN users u ON g.created_by = u.id
        WHERE g.id = $1`,
@@ -138,7 +169,7 @@ const getGroupById = async (req, res, next) => {
 
     // Get assignments and group submission details
     const assignmentsRes = await db.query(
-      `SELECT DISTINCT a.*, 
+      `SELECT a.id, a.title, a.description, a.due_date, a.onedrive_link, a.target_type, a.status,
               s.id as submission_id,
               s.status as submission_status,
               s.confirmed_at as submission_time,
@@ -156,6 +187,14 @@ const getGroupById = async (req, res, next) => {
       [id]
     );
 
+    // Deduplicate assignments by id in JS
+    const uniqueAsgMap = new Map();
+    assignmentsRes.rows.forEach(r => {
+      if (!uniqueAsgMap.has(r.id)) {
+        uniqueAsgMap.set(r.id, r);
+      }
+    });
+
     const metrics = await calculateGroupMetrics(id);
 
     res.json({
@@ -163,7 +202,7 @@ const getGroupById = async (req, res, next) => {
       group: {
         ...group,
         members: membersRes.rows,
-        assignments: assignmentsRes.rows,
+        assignments: Array.from(uniqueAsgMap.values()),
         metrics
       }
     });
@@ -225,7 +264,7 @@ const createGroup = async (req, res, next) => {
 const addMember = async (req, res, next) => {
   try {
     const { id: groupId } = req.params;
-    const { identifier } = req.body; // Can be email or student_id
+    const { identifier } = req.body;
 
     if (!identifier || !identifier.trim()) {
       return res.status(400).json({
