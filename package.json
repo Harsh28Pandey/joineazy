@@ -1,0 +1,27 @@
+{
+  "name": "joineazy-assignment-system",
+  "version": "1.0.0",
+  "description": "Student, Group & Assignment Management System - Joineazy Technical Assignment",
+  "scripts": {
+    "setup": "npm --prefix backend install && npm --prefix frontend install",
+    "backend": "npm --prefix backend start",
+    "frontend": "npm --prefix frontend run dev",
+    "db:seed": "node backend/src/db/seed.js",
+    "db:migrate": "node backend/src/db/migrate.js",
+    "docker:up": "docker compose up --build -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
+  },
+  "keywords": [
+    "react",
+    "tailwind",
+    "nodejs",
+    "express",
+    "postgresql",
+    "docker",
+    "jwt",
+    "joineazy"
+  ],
+  "author": "",
+  "license": "ISC"
+}
